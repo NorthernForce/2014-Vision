@@ -25,10 +25,10 @@ cv::Point3f Control::getOutput(cv::Point2f ball, int size, float dt) {
 		++state; break;
 	case 2:
 		float dtan_el = (ball.y - prev_tan_el) / dt;
-		y = 2.0*lowpass(dtan_el - init_dtan_el, dt);
+		y = 1.1*lowpass(dtan_el - init_dtan_el, dt);
 	}
 
-	w = 2.0*ball.x;
+	x = 1.2*ball.x;
 
 	prev_tan_el = ball.y;
 	return cv::Point3f(x,y,w);

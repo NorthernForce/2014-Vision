@@ -32,7 +32,7 @@ private:
 	struct sockaddr_in out_sa;
 	struct sockaddr_in cmd_sa;
 
-	char out_buf[3];
+	unsigned char out_buf[3];
 	char cmd_buf[256];
 
 	Alliance alliance;

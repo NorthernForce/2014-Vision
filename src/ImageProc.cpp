@@ -55,7 +55,7 @@ void backproject(cv::Mat_<cv::Vec3b>& frame,
 		}
 	}
 
-	cv::erode(output, output, cv::Mat());
+	//cv::erode(output, output, cv::Mat());
 }
 
 void doHistogram(cv::Mat_<cv::Vec3b>& frame, bool done_hist, cv::MatND& target_hist, cv::MatND& background_hist) {

@@ -62,9 +62,9 @@ int cRIO::send(float x, float y, float w) {
 	if(y < -1.0) y = -1.0;
 	if(w > 1.0)  w =  1.0;
 	if(w < -1.0) w = -1.0;
-	out_buf[0] = static_cast<char>(x>=0 ? x*127 : x*128 + 256);
-	out_buf[1] = static_cast<char>(y>=0 ? y*127 : y*128 + 256);
-	out_buf[2] = static_cast<char>(w>=0 ? w*127 : w*128 + 256);
+	out_buf[0] = static_cast<unsigned char>(x>=0 ? x*127 : x*128 + 256);
+	out_buf[1] = static_cast<unsigned char>(y>=0 ? y*127 : y*128 + 256);
+	out_buf[2] = static_cast<unsigned char>(w>=0 ? w*127 : w*128 + 256);
 	return sendto(out_sock, out_buf, sizeof out_buf, 0, (struct sockaddr*)&out_sa, sizeof out_sa);
 }
 
