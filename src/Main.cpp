@@ -7,130 +7,101 @@
 #include <termios.h>
 #include <chrono>
 
-float h_range[] = {0,128};
-float s_range[] = {0,256};
-float v_range[] = {0,256};
-const float* ranges[] = {h_range, s_range};//, v_range};
-int channels[] = {0,1};
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <arpa/inet.h>
 
-/**
- * 
- * Performs two histogram backproejctions. The first is using a
- * histogram of the target, the second is a histogram of the
- * background. The two resulting images are then combined 
- * based on a threshold involving gain1 and gain2, yeilding
- * a single binary image.
- *
- * \param frame input image to perform backprojections on.
- * \param output binary output image.
- * \param gain1
- * \param gain2
- * \param target_hist histogram of the target.
- * \param background_hist histogram of the background
- */
-void backproject(cv::Mat_<cv::Vec3b>& frame, 
-		         cv::Mat_<unsigned char>& output,
-				 float gain1, 
-				 float gain2, 
-				 cv::MatND& target_hist, 
-				 cv::MatND& background_hist) 
-{
-	cv::Mat_<cv::Vec3b> hsv(frame.size());
-	cv::Mat_<unsigned char> target(frame.size());
-	cv::Mat_<unsigned char> background(frame.size());
-	cv::cvtColor(frame, hsv, CV_RGB2HSV);
-
-	cv::calcBackProject(&hsv, 1, channels, target_hist, target, ranges, 1);
-	cv::calcBackProject(&hsv, 1, channels, background_hist, background, ranges, 1);
-
-	for(int j = 0; j < frame.rows; ++j) {
-		for(int i = 0; i < frame.cols; ++i) {
-			if(target(j,i) >= background(j,i)*(gain1 / 2.0f) + (gain2/2.0f)) {
-				output(j, i) = 255;
-			} else {
-				output(j, i) = 0;
-			}
-		}
-	}
-
-	cv::erode(output, output, cv::Mat());
-}
-
-void doHistogram(cv::Mat_<cv::Vec3b>& frame, cv::MatND& target_hist, cv::MatND& background_hist) {
-    cv::Mat_<cv::Vec3b> hsv(frame.size());
-    cv::cvtColor(frame, hsv, CV_RGB2HSV);
-    int hbins = 32, sbins = 32;
-    int histSize[] = {hbins,sbins};
-
-    cv::Mat_<unsigned char> mask(frame.size());
-
-    for(int j = 0; j < mask.rows; ++j) {
-        for(int i = 0; i < mask.cols; ++i) {
-            float x = i - mask.cols/2;
-            float y = mask.rows/2 - j;
-            float d = sqrt(x*x + y*y);
-            if(d > 50.0f) {
-                mask(j,i) = 0;
-            } else {
-                mask(j,i) = 255;
-            }
-        }
-    }
-
-    calcHist(&hsv, 1, channels, mask, target_hist, 2, histSize, ranges, true, false);
-
-    for(int j = 0; j < mask.rows; ++j) {
-        for(int i = 0; i < mask.cols; ++i) {
-            float x = i - mask.cols/2;
-            float y = mask.rows/2 - j;
-            float d = sqrt(x*x + y*y);
-            if(d <= 60.0f) {
-                mask(j,i) = 0;
-            } else {
-                mask(j,i) = 255;
-            }
-        }
-    }
-
-    calcHist(&hsv, 1, channels, mask, background_hist, 2, histSize, ranges, true, false);
-}
+#include "cRIO.h"
+#include "ImageProc.h"
+#include "Control.h"
 
 int main(int argc, char** argv) {
-	int gain1 = 3;
-	int gain2 = 0;
-	bool done_hist = true;
+	bool server = false;
 	bool disp_rgb = true;
-	std::string histogramFile = "/root/histograms.yml";
-
+	std::string histogramFile = "/root/target.yml";
+	std::string cameraFile = "/root/camera.yml";
 	for(int i = 0; i < argc; ++i) {
-		if(argv[i] == std::string("--hist")) {
+		if(argv[i] == std::string("--target")) {
 			if(++i < argc) {
 				histogramFile = argv[i];
 			}
+		} else if(argv[i] == std::string("server")) {
+			server = true;
 		}
 	}
-	
-    cv::namedWindow("Cam Proc");
-    cv::createTrackbar("Gain 1", "Cam Proc", &gain1, 10);
-    cv::createTrackbar("Gain 2", "Cam Proc", &gain2, 10);
+
+	Control control;
+	cRIO crio(1726);
+	crio.start();
+
+	float gain1;
+	float gain2;
+
+	bool done_red = false;
+	bool done_blue = false;
+	bool done_back = false;
+
+	// Effective focal lengths of the camera
+	// For unknown focal lengths initialized to 1
+	float fx = 1.0;
+	float fy = 1.0;
+	float cx = 80;
+	float cy = 60;
 
 	// Get video from /dev/video0
     cv::VideoCapture cam(0);
 	// Set resolution to 160x120
-    cam.set(CV_CAP_PROP_FRAME_WIDTH, 320);
-    cam.set(CV_CAP_PROP_FRAME_HEIGHT, 240);
+    cam.set(CV_CAP_PROP_FRAME_WIDTH, 160);
+    cam.set(CV_CAP_PROP_FRAME_HEIGHT, 120);
+	cam.set(CV_CAP_PROP_EXPOSURE, 200);
 
-	cv::MatND target_hist;
+	cv::MatND blue_hist;
+	cv::MatND red_hist;
 	cv::MatND background_hist;
+
+	cv::Mat_<double> cameraMatrix;
+	cv::Mat_<double> distCoefficients;
+
+	float tanCamAngle = 0.0;
 
 	cv::FileStorage histograms(histogramFile, cv::FileStorage::READ);
 	if(histograms.isOpened()) {
-		histograms["target"] >> target_hist;
+		histograms["blue_ball"] >> blue_hist;
+		histograms["red_ball"] >> red_hist;
+		histograms["done_red"] >> done_red;
+		histograms["done_blue"] >> done_blue;
+		histograms["done_background"] >> done_back;
 		histograms["background"] >> background_hist;
-		done_hist = true;
+		histograms["gain1"] >> gain1;
+		histograms["gain2"] >> gain2;
+
+		if(histograms["cam_angle"].isInt() ||
+		   histograms["cam_angle"].isReal()) {
+			float camAngle;
+			histograms["cam_angle"] >> camAngle;
+			tanCamAngle = tan(camAngle);
+		}
 	} else {
+		gain1 = 2.5;
+		gain2 = 0.1;
+
 		std::cout << "Couldn't open histogram data file.\n";
-		done_hist = false;
+	}
+
+	cv::FileStorage camera(cameraFile, cv::FileStorage::READ);
+	if(camera.isOpened()) {
+		camera["Camera_Matrix"] >> cameraMatrix;
+		camera["Distortion_Coefficients"] >> distCoefficients;
+
+		fx = cameraMatrix(0,0);
+		fy = cameraMatrix(1,1);
+
+		cx = cameraMatrix(0,2);
+		cy = cameraMatrix(1,2);
 	}
 
 
@@ -141,74 +112,119 @@ int main(int argc, char** argv) {
 
     cv::Mat_<cv::Vec3b> frame(cam.get(CV_CAP_PROP_FRAME_HEIGHT), cam.get(CV_CAP_PROP_FRAME_WIDTH));
 	cv::Mat_<unsigned char> backprojection(frame.size());
+	cv::Mat_<cv::Vec3b> backout(frame.size());
 
-    int key;
-    while(key = cv::waitKey(1)) {
-		// Get next frame from the camera.
+	if(!server) {
+		cv::namedWindow("Frame");
+	}
+
+    while(true) {
+		Alliance alliance = BLUE;
+		/*
+		if(server) {
+			alliance = crio.getAlliance();
+		}
+		*/
+
 		cam >> frame;
-		if(done_hist) {
-			backproject(frame, backprojection, gain1, gain2, target_hist, background_hist);
+
+		if(alliance == NONE) {
+			// Sleep for 20ms
+			control.reset();
+			usleep(20*1000);
+			continue;
+		}
+
+		// Get next frame from the camera.
+		if (
+			( (alliance == RED ) && done_red  ) || 
+		    ( (alliance == BLUE) && done_blue ) 
+		) {
+			switch(alliance) {
+			case RED:
+				img::backproject(frame, backprojection, gain1, gain2, red_hist, background_hist);
+				break;
+			case BLUE:
+				img::backproject(frame, backprojection, gain1, gain2, blue_hist, background_hist);
+				break;
+			default:
+				continue;
+			}
 
 			if(!disp_rgb) {
 				cv::cvtColor(backprojection, frame, CV_GRAY2RGB);
 			}
 
-			std::vector<std::vector<cv::Point> > contours;
-			cv::findContours(backprojection, contours, CV_RETR_EXTERNAL, CV_CHAIN_APPROX_SIMPLE);
+			cv::Point centroid;
+			std::vector<std::vector<cv::Point>> contours;
+			int i = img::findBall(backprojection, centroid, contours);
 
-			int bestContour_index = -1;
-			float bestContour_score = 100.0;
+			if(i >= 0) {
+				now = std::chrono::system_clock::now();
+				std::chrono::duration<float> _dt = now - last;
+				now = last;
+				float dt = _dt.count();
+				int size = cv::contourArea(contours[i]);
 
-			for(int i = 0; i < contours.size(); ++i) {
-				if(cv::contourArea(contours[i]) > bestContour_score) {
-					bestContour_index = i;
-				}
+				cv::Point2f ball;
+				// Tangent of yaw to the ball
+				ball.x = (float)(cx - centroid.x) / fx;
+				// Tangent of elevation to the ball
+				ball.y = (float)(tanCamAngle + (cy - centroid.y)/fy) / (1 - tanCamAngle*(cy - centroid.y)/fy);
+				//std::cout << ball.x << " " << ball.y << std::endl;
+
+				cv::drawContours(frame, contours, i, cv::Scalar(0,255,0), 1);
+				cv::circle(frame, centroid, 3, cv::Scalar(0,255,0), CV_FILLED);
+
+				crio.send(control.getOutput(ball,size,dt));
 			}
-
-			if(bestContour_index >= 0) {
-				cv::Moments m = cv::moments(contours[bestContour_index]);
-				cv::drawContours(frame, contours, bestContour_index, cv::Scalar(255,0,0), 1);
-				cv::circle(frame, cv::Point(m.m10/m.m00, m.m01/m.m00), 3, cv::Scalar(255, 0, 0), CV_FILLED);
-			}
-
 		}
 
-		cv::circle(frame, cv::Point(frame.size().width/2, frame.size().height/2), 50, cv::Scalar(0,255,0), 1);
-		cv::imshow("Cam Proc", frame);
+		cv::circle(frame, cv::Point(frame.size().width/2, frame.size().height/2), 25, cv::Scalar(0,255,0), 1);
 
-	    // Compute framerate once every second
-        now = std::chrono::system_clock::now();
-	    std::chrono::duration<double> diff = now - last;
-        n++;
-        if(diff.count() >= 1.0) {
-            std::cout << "FPS: " << (n/diff.count()) << "\n";
-            last = now;
-            n = 0;
-        }
+		if(!server) {
+			cv::imshow("Frame", frame);
+		}
 
-        switch(key) {
+        switch(cv::waitKey(1)) {
         case 'q':
         case 'Q':
             goto done;
         case 'x':
         case 'X':
-            std::cout << "X Pressed" << std::endl;
             disp_rgb = !disp_rgb;
             break;
-        case 'c':
-        case 'C':
-            doHistogram(frame, target_hist, background_hist);
+		case 'b':
+		case 'B':
+			img::doHistogram(frame, done_blue, blue_hist, background_hist);
+			done_blue = true;
+			done_back = true;
+		case 'r':
+		case 'R':
+			img::doHistogram(frame, done_red, red_hist, background_hist);
+			done_red = true;
+			done_back = true;
+			break;
+		case 't':
+		case 'T':
+			break;
+		case 's':
+		case 'S':
 			histograms.open(histogramFile, cv::FileStorage::WRITE);
-			histograms << "target" << target_hist;
+			histograms << "red_ball" << red_hist;
+			histograms << "blue_ball" << blue_hist;
+			histograms << "done_red" << done_red;
+			histograms << "done_blue" << done_blue;
+			histograms << "done_background" << done_back;
 			histograms << "background " << background_hist;
+			histograms << "gain1" << gain1;
+			histograms << "gain2" << gain2;
 			histograms.release();
-			done_hist = true;
-            break;
+			break;
         default:
 	        break;
         }
     }
-
 done:
     return 0;
 }
