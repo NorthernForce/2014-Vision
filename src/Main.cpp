@@ -1,140 +1,75 @@
-#include "PiCam.hpp"
 #include <stdexcept>
 #include <iostream>
 #include <cstdlib>
 #include <opencv2/imgproc/imgproc.hpp>
+#include <opencv2/highgui/highgui.hpp>
 #include <unistd.h>
 #include <termios.h>
-#include <bcm2835.h>
+#include <chrono>
 
-int n = 0;
-unsigned char target = 0;
-float h_range[] = {0,256};
+float h_range[] = {0,128};
 float s_range[] = {0,256};
 float v_range[] = {0,256};
 const float* ranges[] = {h_range, s_range};//, v_range};
-
 int channels[] = {0,1};
 
-int threshold = 410;
-
-DISPMANX_DISPLAY_HANDLE_T display;
-DISPMANX_ELEMENT_HANDLE_T element;
-DISPMANX_RESOURCE_HANDLE_T display_resource;
-
-/*
-int hue = 0;
-int range = 0;
-int s_min = 0;
-int s_max = 0;
-int v_min = 0;
-int v_max = 0;
-*/
-
-bool disp_rgb = true;
-
-cv::MatND hist;
-cv::MatND back_hist;
-bool done_hist = false;
-//cv::MatND hist;
-
 /**
- * Process a single frame. 
+ * 
+ * Performs two histogram backproejctions. The first is using a
+ * histogram of the target, the second is a histogram of the
+ * background. The two resulting images are then combined 
+ * based on a threshold involving gain1 and gain2, yeilding
+ * a single binary image.
  *
- * This does not have to be a global function; it could also
- * be put inline as a lambda function.
- *
- * @param frame the frame to be processed.
+ * \param frame input image to perform backprojections on.
+ * \param output binary output image.
+ * \param gain1
+ * \param gain2
+ * \param target_hist histogram of the target.
+ * \param background_hist histogram of the background
  */
-void process_frame(cv::Mat frame) {
-    ++n;
-    cv::Mat_<cv::Vec3b> hsv(frame.size());
-    cv::Mat_<unsigned char> binary(frame.size());
-    cv::Mat_<unsigned char> back(frame.size());
-    cv::Mat_<cv::Vec3b> disp(frame.size());
-    cv::cvtColor(frame, hsv, CV_RGB2HSV_FULL);
-    frame.copyTo(disp);
-    //cv::cvtColor(frame, disp, CV_RGB2BGR);
-    //int min[] = {hue-range, 0, 0};
-    //int max[] = {hue+range, 255, 255};
-    /*
-    cv::inRange(hsv, cv::Scalar(hue-range, s_min, v_min), cv::Scalar(hue+range, s_max, v_max), binary);
-    */
-    int numP = 0;
-    if(done_hist) {
-        cv::calcBackProject(&hsv, 1, channels, hist, binary, ranges, 1);
-        cv::calcBackProject(&hsv, 1, channels, back_hist, back, ranges, 1);
-        //cv::inRange(binary, 150, 255, binary);
-        //cv::morphologyEx(binary, binary, cv::MORPH_CLOSE, getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(20, 20)));
-        //cv::close(binary, binary, getStructuringElement(MORPH_ELLIPSE, cv::Size(2*10+1, 2*10+1), cv::Point(10, 10)));
+void backproject(cv::Mat_<cv::Vec3b>& frame, 
+		         cv::Mat_<unsigned char>& output,
+				 float gain1, 
+				 float gain2, 
+				 cv::MatND& target_hist, 
+				 cv::MatND& background_hist) 
+{
+	cv::Mat_<cv::Vec3b> hsv(frame.size());
+	cv::Mat_<unsigned char> target(frame.size());
+	cv::Mat_<unsigned char> background(frame.size());
+	cv::cvtColor(frame, hsv, CV_RGB2HSV);
 
-        float centroid_x = 0.0f;
-        float centroid_y = 0.0f;
-        for(int j = 0; j < frame.rows; ++j) {
-            for(int i = 0; i < frame.cols; ++i) {
-                float weight = binary(j, i);
-                float back_weight = back(j, i);
-                if(weight > back_weight * (threshold / 500.0f)) {
-                    binary(j, i) = 255;
-                //if(weight > 200) {
-                    numP += weight;
-                    centroid_x += i * weight;
-                    centroid_y += j * weight;
-                } else {
-                    binary(j, i) = 0;
-                }
-            }
-        }
-        centroid_x /= numP;
-        centroid_y /= numP;
+	cv::calcBackProject(&hsv, 1, channels, target_hist, target, ranges, 1);
+	cv::calcBackProject(&hsv, 1, channels, background_hist, background, ranges, 1);
 
-        if(!disp_rgb) {
-            cv::cvtColor(binary, disp, CV_GRAY2RGB);
-        }
+	for(int j = 0; j < frame.rows; ++j) {
+		for(int i = 0; i < frame.cols; ++i) {
+			if(target(j,i) >= background(j,i)*(gain1 / 2.0f) + (gain2/2.0f)) {
+				output(j, i) = 255;
+			} else {
+				output(j, i) = 0;
+			}
+		}
+	}
 
-        cv::circle(disp, cv::Point((int)centroid_x, (int)centroid_y), 5, cv::Scalar(255, 0, 0), -1);
-
-        float r = sqrt(centroid_x*centroid_x + centroid_y*centroid_y);
-    }
-
-    cv::circle(disp, cv::Point(frame.size().width/2,frame.size().height/2), 25, cv::Scalar(0, 255, 0));
-
-    
-    VC_RECT_T dst_rect;
-    vc_dispmanx_rect_set( &dst_rect, 0, 0, disp.cols, disp.rows);
-    int ret = vc_dispmanx_resource_write_data(  display_resource,
-                                            VC_IMAGE_RGB888,
-                                            disp.cols*3,
-                                            disp.data,
-                                            &dst_rect);
-    assert(ret==0);
-    DISPMANX_UPDATE_HANDLE_T update = vc_dispmanx_update_start( 10 );
-    vc_dispmanx_element_modified(update, element, &dst_rect);
-    vc_dispmanx_update_submit_sync(update);
-
-
-    //cv::imshow("RPi Cam Raw", disp);
-    //cv::imshow("RPi Cam Proc", binary);
+	cv::erode(output, output, cv::Mat());
 }
 
-int _hist_;
-
-PiCam* cam;
-
-void doHistogram() {
-    cv::Mat hsv(cam->frame.size(), CV_8UC3);
-    cv::cvtColor(cam->frame, hsv, CV_RGB2HSV_FULL);
-    int hbins = 256, sbins = 256;
+void doHistogram(cv::Mat_<cv::Vec3b>& frame, cv::MatND& target_hist, cv::MatND& background_hist) {
+    cv::Mat_<cv::Vec3b> hsv(frame.size());
+    cv::cvtColor(frame, hsv, CV_RGB2HSV);
+    int hbins = 32, sbins = 32;
     int histSize[] = {hbins,sbins};
 
-    cv::Mat_<unsigned char> mask(cam->frame.size());
+    cv::Mat_<unsigned char> mask(frame.size());
 
     for(int j = 0; j < mask.rows; ++j) {
         for(int i = 0; i < mask.cols; ++i) {
             float x = i - mask.cols/2;
             float y = mask.rows/2 - j;
             float d = sqrt(x*x + y*y);
-            if(d > 25.0f) {
+            if(d > 50.0f) {
                 mask(j,i) = 0;
             } else {
                 mask(j,i) = 255;
@@ -142,14 +77,14 @@ void doHistogram() {
         }
     }
 
-    calcHist(&hsv, 1, channels, mask, hist, 2, histSize, ranges, true, false);
+    calcHist(&hsv, 1, channels, mask, target_hist, 2, histSize, ranges, true, false);
 
     for(int j = 0; j < mask.rows; ++j) {
         for(int i = 0; i < mask.cols; ++i) {
             float x = i - mask.cols/2;
             float y = mask.rows/2 - j;
             float d = sqrt(x*x + y*y);
-            if(d <= 30.0f) {
+            if(d <= 60.0f) {
                 mask(j,i) = 0;
             } else {
                 mask(j,i) = 255;
@@ -157,123 +92,123 @@ void doHistogram() {
         }
     }
 
-    calcHist(&hsv, 1, channels, mask, back_hist, 2, histSize, ranges, true, false);
-
-    done_hist = true;
+    calcHist(&hsv, 1, channels, mask, background_hist, 2, histSize, ranges, true, false);
 }
 
-void doNothing(int,void*) {}
-
 int main(int argc, char** argv) {
-    bool keyboard = false;
+	int gain1 = 3;
+	int gain2 = 0;
+	bool done_hist = true;
+	bool disp_rgb = true;
+	std::string histogramFile = "/root/histograms.yml";
 
-    if(argc > 1) {
-        for(int i = 1; i < argc; ++i) {
-            if(strcmp(argv[i], "--keyboard") == 0) {
-                keyboard = true;
-                std::cout << "Changing terminal keyboard mode.\n";
-            } else {
-                std::cerr << "Invalid argument '" << argv[i] << "'\n";
-                exit(1);
-            }
-        }
-    }
+	for(int i = 0; i < argc; ++i) {
+		if(argv[i] == std::string("--hist")) {
+			if(++i < argc) {
+				histogramFile = argv[i];
+			}
+		}
+	}
+	
+    cv::namedWindow("Cam Proc");
+    cv::createTrackbar("Gain 1", "Cam Proc", &gain1, 10);
+    cv::createTrackbar("Gain 2", "Cam Proc", &gain2, 10);
 
-    cam = new PiCam(160, 120, &process_frame);
+	// Get video from /dev/video0
+    cv::VideoCapture cam(0);
+	// Set resolution to 160x120
+    cam.set(CV_CAP_PROP_FRAME_WIDTH, 320);
+    cam.set(CV_CAP_PROP_FRAME_HEIGHT, 240);
 
-    int ret;
-    display = vc_dispmanx_display_open(0); // "window"
+	cv::MatND target_hist;
+	cv::MatND background_hist;
 
-    unsigned int vc_image_ptr;
+	cv::FileStorage histograms(histogramFile, cv::FileStorage::READ);
+	if(histograms.isOpened()) {
+		histograms["target"] >> target_hist;
+		histograms["background"] >> background_hist;
+		done_hist = true;
+	} else {
+		std::cout << "Couldn't open histogram data file.\n";
+		done_hist = false;
+	}
 
-    display_resource = vc_dispmanx_resource_create(VC_IMAGE_RGB888, 160 | (160*3) << 16, 120, &vc_image_ptr);
 
-    VC_DISPMANX_ALPHA_T alpha = { /*DISPMANX_FLAGS_ALPHA_FROM_SOURCE |*/ DISPMANX_FLAGS_ALPHA_FIXED_ALL_PIXELS, 
-                             255, /*alpha 0->255*/
-                             0 };
-    VC_RECT_T dst_rect;
-    VC_RECT_T src_rect;
+	// Counter and timestamp for computing framerate
+    int n = 0;
+    std::chrono::time_point<std::chrono::system_clock> last = std::chrono::system_clock::now();
+	std::chrono::time_point<std::chrono::system_clock> now;
 
-    DISPMANX_MODEINFO_T info;
-    ret = vc_dispmanx_display_get_info(display, &info);
-    assert(ret==0);
-
-    //vc_dispmanx_rect_set( &dst_rect, 0, 0, 160, 120);
-    vc_dispmanx_rect_set( &src_rect, 0, 0, 160<<16, 120<<16);
-
-    vc_dispmanx_rect_set( &dst_rect, 0,
-                                     0,
-                                     info.width,
-                                     info.height );
-
-    DISPMANX_UPDATE_HANDLE_T update = vc_dispmanx_update_start(10);
-    assert(update != DISPMANX_NO_HANDLE);
-
-    element = vc_dispmanx_element_add(  update,
-                                        display,
-                                        2000,               // layer
-                                        &dst_rect,
-                                        display_resource,
-                                        &src_rect,
-                                        DISPMANX_PROTECTION_NONE,
-                                        &alpha,
-                                        NULL,             // clamp
-                                        //VC_IMAGE_ROT0 );
-                                        DISPMANX_NO_ROTATE);
-    ret = vc_dispmanx_update_submit_sync(update);
-    assert(ret == 0);
-
-    cam->start();
-
-    struct termios term;
-    struct termios init_term;
-
-    if(keyboard) {
-        tcgetattr(STDIN_FILENO, &term);
-        init_term = term;
-        term.c_lflag &= ~ICANON;
-        term.c_lflag &= ~ECHO;
-        tcsetattr(STDIN_FILENO, TCSANOW, &term);
-    }
+    cv::Mat_<cv::Vec3b> frame(cam.get(CV_CAP_PROP_FRAME_HEIGHT), cam.get(CV_CAP_PROP_FRAME_WIDTH));
+	cv::Mat_<unsigned char> backprojection(frame.size());
 
     int key;
+    while(key = cv::waitKey(1)) {
+		// Get next frame from the camera.
+		cam >> frame;
+		if(done_hist) {
+			backproject(frame, backprojection, gain1, gain2, target_hist, background_hist);
 
-    bcm2835_init();
-    bcm2835_gpio_fsel(RPI_V2_GPIO_P1_03, BCM2835_GPIO_FSEL_INPT);
-    bcm2835_gpio_ren(RPI_V2_GPIO_P1_03);
+			if(!disp_rgb) {
+				cv::cvtColor(backprojection, frame, CV_GRAY2RGB);
+			}
 
-    while(true) {
-        // Get all input from stdin
-        while((key=std::getchar()) != EOF) {
-            switch(key) {
-            case 'q':
-            case 'Q':
-                goto done;
-            case 'x':
-            case 'X':
-                disp_rgb = !disp_rgb;
-            case 'c':
-            case 'C':
-                doHistogram();
-            }
+			std::vector<std::vector<cv::Point> > contours;
+			cv::findContours(backprojection, contours, CV_RETR_EXTERNAL, CV_CHAIN_APPROX_SIMPLE);
+
+			int bestContour_index = -1;
+			float bestContour_score = 100.0;
+
+			for(int i = 0; i < contours.size(); ++i) {
+				if(cv::contourArea(contours[i]) > bestContour_score) {
+					bestContour_index = i;
+				}
+			}
+
+			if(bestContour_index >= 0) {
+				cv::Moments m = cv::moments(contours[bestContour_index]);
+				cv::drawContours(frame, contours, bestContour_index, cv::Scalar(255,0,0), 1);
+				cv::circle(frame, cv::Point(m.m10/m.m00, m.m01/m.m00), 3, cv::Scalar(255, 0, 0), CV_FILLED);
+			}
+
+		}
+
+		cv::circle(frame, cv::Point(frame.size().width/2, frame.size().height/2), 50, cv::Scalar(0,255,0), 1);
+		cv::imshow("Cam Proc", frame);
+
+	    // Compute framerate once every second
+        now = std::chrono::system_clock::now();
+	    std::chrono::duration<double> diff = now - last;
+        n++;
+        if(diff.count() >= 1.0) {
+            std::cout << "FPS: " << (n/diff.count()) << "\n";
+            last = now;
+            n = 0;
         }
 
-        if(bcm2835_gpio_eds(RPI_V2_GPIO_P1_03)) {
-            std::cout << "Rising edge detected on GPIO pin P1-3\n";
-            bcm2835_gpio_set_eds(RPI_V2_GPIO_P1_03);
+        switch(key) {
+        case 'q':
+        case 'Q':
+            goto done;
+        case 'x':
+        case 'X':
+            std::cout << "X Pressed" << std::endl;
+            disp_rgb = !disp_rgb;
+            break;
+        case 'c':
+        case 'C':
+            doHistogram(frame, target_hist, background_hist);
+			histograms.open(histogramFile, cv::FileStorage::WRITE);
+			histograms << "target" << target_hist;
+			histograms << "background " << background_hist;
+			histograms.release();
+			done_hist = true;
+            break;
+        default:
+	        break;
         }
-
-        usleep(50000);
     }
 
 done:
-
-    if(keyboard) {
-        tcsetattr(STDIN_FILENO, TCSANOW, &init_term);
-    }
-
-    bcm2835_gpio_clr_ren(RPI_V2_GPIO_P1_03);
-    bcm2835_close();
-
     return 0;
 }
